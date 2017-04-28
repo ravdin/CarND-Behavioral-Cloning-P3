@@ -2,36 +2,51 @@ import csv
 import cv2
 import numpy as np
 
-nb_epoch = 2
-correction = 0.1
-image_paths, angles = [], []
+nb_epoch = 35
+correction = 0.25
+data = []
 with open('../data/driving_log.csv') as csvfile:
   reader = csv.reader(csvfile)
   for row in reader:
-    if float(row[6]) < 0.1:
+    # Skip samples where the speed is low.
+    if float(row[6]) < 1:
       continue
-    image_paths.extend(row[0:3])
+    image_center = row[0]
     steering_center = float(row[3])
-    steering_left = steering_center + correction
-    steering_right = steering_center - correction
-    angles.extend([steering_center, steering_left, steering_right])
+    # Reject 95% of the samples where the steering angle is 0.
+    if steering_center == 0 and np.random.random() > 0.05:
+        continue
+    data.append((image_center, steering_center, False))
+    if steering_center != 0:
+        data.append((image_center, -steering_center, True))
+    # For a right turn, use the left camera image and add correction
+    if steering_center > 0 and steering_center + correction <= 1.0:
+        image_left = row[1]
+        angle = steering_center + correction
+        data.append((image_left, angle, False))
+        data.append((image_left, -angle, True))
+    # For a left turn, use the right camera image and subtract correction
+    if steering_center < 0 and steering_center - correction >= -1.0:
+        image_right = row[2]
+        angle = steering_center - correction
+        data.append((image_right, angle, False))
+        data.append((image_right, -angle, True))
 
 from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
-image_paths_train, image_paths_test, angles_train, angles_test = train_test_split(image_paths, angles, test_size=0.2)
+data = shuffle(data)
+data_train, data_test = train_test_split(data, test_size=0.05)
 
-def preprocessImage(image, angle):
+def preprocessImage(image, flip):
     # Image is 320x160x3
     # Crop to 250x160x3
-    image = image[0:160, 50:300, :]
-    image = augment_brightness_camera_images(image)
+    result = image[0:160, 50:300, :]
+    result = cv2.GaussianBlur(result, (5, 5), 0)
     # Resize to 200x66x3
-    image = cv2.resize(image, (200, 66))
-    #Randomly flip half the images on a horizontal axis
-    if np.random.random_sample() < 0.5:
-        image = cv2.flip(image, 1)
-        angle = -angle
-    return (image, angle)
+    result = cv2.resize(result, (200, 66), interpolation = cv2.INTER_AREA)
+    if flip:
+        result = cv2.flip(result, 1)
+    return result
 
 # Source for this method:
 # https://medium.com/@vivek.yadav/improved-performance-of-deep-learning-neural-network-models-on-traffic-sign-classification-using-6355346da2dc
@@ -45,22 +60,27 @@ def augment_brightness_camera_images(image):
     image1 = cv2.cvtColor(image1,cv2.COLOR_HSV2RGB)
     return image1
 
-def generator(image_paths, angles, batch_size=32):
-  num_samples = len(image_paths)
-  X, y = [], []
-  image_paths, angles = shuffle(image_paths, angles)
-  while 1:
-    for i in range(batch_size):
-      (image, angle) = preprocessImage(cv2.imread(image_paths[i]), angles[i])
-    X.append(image)
-    y.append(angle)
-    if len(X) == batch_size:
+def generator(items, batch_size=32, validation_flag=False):
+    num_samples = len(items)
+    X, y = [], []
+    items = shuffle(items)
+    while 1:
+        for i in range(batch_size):
+           (image_path, angle, flip) = items[i]
+           image = preprocessImage(cv2.imread(image_path), flip)
+           if not validation_flag:
+               image = augment_brightness_camera_images(image)
+           X.append(image)
+           y.append(angle)
         yield (np.array(X), np.array(y))
         X, y = [], []
-        image_paths, angles = shuffle(image_paths, angles)
+        items = shuffle(items)
 
-train_generator = generator(image_paths_train, angles_train, batch_size=32)
-validation_generator = generator(image_paths_test, angles_test, batch_size=32)
+batch_size = 128
+num_steps = len(data_train) / batch_size
+train_generator = generator(data_train, batch_size, False)
+validation_generator = generator(data_train, batch_size, True)
+test_generator = generator(data_test, batch_size, True)
 
 from keras.models import Sequential
 from keras.layers import Flatten, Dense, Lambda, Cropping2D
@@ -81,6 +101,11 @@ model.add(Dense(10))
 model.add(Dense(1))
 
 model.compile(loss='mse', optimizer='adam', lr=1e-3)
-model.fit_generator(train_generator, steps_per_epoch=len(angles_train), validation_data=validation_generator, validation_steps=len(angles_test), epochs=nb_epoch)
+model.fit_generator(train_generator, steps_per_epoch=num_steps, validation_data=validation_generator, validation_steps=num_steps, epochs=nb_epoch)
 
 model.save('model.h5')
+
+for X_test, y_test in test_generator:
+    test_loss = model.test_on_batch(X_test, y_test)
+    print('Test loss: {0}'.format(test_loss))
+    break
